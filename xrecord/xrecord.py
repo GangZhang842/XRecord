@@ -21,6 +21,8 @@ class XRecord(object):
         self._cur = 0
 
     def open(self, fname, mode='r'):
+        self.fname = fname
+        self.mode = mode
         self.pos = 0
         if mode == 'r':
             self.file_key = open(fname + '.key', "r")
