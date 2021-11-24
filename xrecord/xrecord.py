@@ -99,3 +99,37 @@ class XRecord(object):
 
     def __len__(self):
         return len(self.keys)
+
+
+class XRecordReadList(object):
+    def __init__(self, fname_list):
+        self.fname_list = fname_list
+        assert type(self.fname_list) in [list, tuple]
+        self.rec_list = []
+        for fn in self.fname_list:
+            self.rec_list.append(XRecord(fn, mode='r'))
+    
+    def close(self):
+        for i in range(len(self.rec_list)):
+            self.rec_list[i].close()
+    
+    def __del__(self):
+        self.close()
+    
+    def read(self, key):
+        result_byte = None
+        for rec in self.rec_list:
+            if key in rec.key_dic:
+                result_byte = rec.read(key)
+                break
+        
+        if result_byte is None:
+            print('{} does not exists!'.format(key))
+        else:
+            return result_byte
+    
+    def __len__(self):
+        s = 0
+        for rec in self.rec_list:
+            s = s + len(rec)
+        return s

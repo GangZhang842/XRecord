@@ -1,1 +1,1 @@
-from .xrecord import XRecord
+from .xrecord import XRecord, XRecordReadList
