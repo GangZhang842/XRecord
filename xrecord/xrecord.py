@@ -106,8 +106,11 @@ class XRecordReadList(object):
         self.fname_list = fname_list
         assert type(self.fname_list) in [list, tuple]
         self.rec_list = []
+        self.keys = []
         for fn in self.fname_list:
-            self.rec_list.append(XRecord(fn, mode='r'))
+            rec_tmp = XRecord(fn, mode='r')
+            self.rec_list.append(rec_tmp)
+            self.keys += rec_tmp.keys
     
     def close(self):
         for i in range(len(self.rec_list)):
@@ -129,7 +132,4 @@ class XRecordReadList(object):
             return result_byte
     
     def __len__(self):
-        s = 0
-        for rec in self.rec_list:
-            s = s + len(rec)
-        return s
+        return len(self.keys)
