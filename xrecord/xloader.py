@@ -9,7 +9,10 @@ class XDataset(object):
     A dataset class for data process
     """
     def __init__(self):
-        pass
+        raise NotImplementedError
+
+    def transform_func(self):
+        raise NotImplementedError
 
     def read_iter(self):
         """
@@ -18,7 +21,7 @@ class XDataset(object):
         pass
 
     def __len__(self):
-        pass
+        raise NotImplementedError
 
 
 class XLoader(object):
