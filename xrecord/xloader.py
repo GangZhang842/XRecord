@@ -1,6 +1,7 @@
 import numpy as np
 
 import torch
+import random
 import os
 
 from abc import abstractmethod, ABCMeta
@@ -113,9 +114,9 @@ class XTrainLoader(object):
                 w.close()
     
     def __worker(self, idx):
-        buffers = []
         rank = self.rank
         while True:
+            buffers = []
             part = (idx * self.world_size + rank, self.num_workers * self.world_size)
             for data in self.xdataset.gene_iter(part):
                 if len(buffers) >= self.shuffle_queue_size:
@@ -125,6 +126,10 @@ class XTrainLoader(object):
                     self.worker_queue.put(item_tmp)
                 else:
                     buffers.append(data)
+            
+            random.shuffle(buffers)
+            for data in buffers:
+                self.worker_queue.put(data)
             
             # transfer into next data block
             rank = rank + 1
