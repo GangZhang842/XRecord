@@ -1,185 +1,263 @@
 import numpy as np
+
+import torch
 import os
+
+from abc import abstractmethod, ABCMeta
 
 import multiprocessing
 
 
-class XDataset(object):
+class XDataset(metaclass=ABCMeta):
     """
     A dataset class for data process
     """
+    @abstractmethod
     def __init__(self):
-        raise NotImplementedError
-
-    def transform_func(self):
-        raise NotImplementedError
-
-    def read_iter(self):
+        pass
+    
+    @abstractmethod
+    def gene_iter(self, part=None):
         """
-        iterative function
+        iterative function for generating data.
+        part=(part_id, part_num) means the total dataset is split into "part_num" parts
+        and the $part_id_{th}$ part is used, which is required in the distributed training system.
+        By default, part is set as None, meaning that the whole dataset is loaded.
         """
         pass
-
+    
+    @abstractmethod
     def __len__(self):
-        raise NotImplementedError
+        pass
 
 
-class XLoader(object):
+def collate_fn_meta(meta_data):
+    if isinstance(meta_data[0], np.ndarray):
+        data_out = torch.as_tensor(np.stack(meta_data, axis=0))
+        return data_out
+    elif isinstance(meta_data[0], torch.Tensor):
+        data_out = torch.stack(meta_data, dim=0)
+        return data_out
+    else:
+        return meta_data
+
+
+def collate_fn_default(batch):
+    result = []
+    if type(batch[0]) in [list, tuple]:
+        for batch_meta_data in zip(*batch):
+            result.append(collate_fn_meta(batch_meta_data))
+        return result
+    else:
+        return collate_fn_meta(batch)
+
+
+class XTrainLoader(object):
     """
-    A fast dataset loader with multi-process
+    A fast dataset loader for distributed training
     """
-    def __init__(self, fname, batch_size=1, shuffle=False, total_sample_num=None, num_workers=None, rank=0, world_size=1, collate_fn=None):
+    def __init__(self, xdataset, batch_size=1, num_workers=1, rank=0, world_size=1, collate_fn=collate_fn_default):
         """
-        fname: str or list of str
+        xdataset: an object of XDataset
         batch_size: batch_size on each node
-        shuffle: whether to shuffle the sample
-        total_sample_num: define the total sample number, it will read from file, if total_sample_num=None
         num_workers: number of workers on each node
         rank: rank of the node
         world_size: total number of the nodes
         collate_fn: merges a list of samples to form a mini-batch of Tensor
         """
-        self.fname = fname
+        self.xdataset = xdataset
         self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.total_sample_num = total_sample_num
         self.num_workers = num_workers
         self.rank = rank
         self.world_size = world_size
         self.collate_fn = collate_fn
 
+        assert isinstance(self.xdataset, XDataset)
         assert self.rank < self.world_size
 
-        self.shuffle_queue_size = self.batch_size * 32
-
-        # data processing utilities
-        self.transform = transform
-        self.transform_kwargs = transform_kwargs
-
-        # save parameters as properties
-        self.data_size = int(os.popen('wc -l {}.idx'.format(self.record_file)).read().split()[0])
-        if self.total_sample is not None:
-            self.data_size = self.total_sample
-
-        self.shuffle = shuffle
-        self.random_state = np.random.RandomState(seed=5)
+        # shuffle data parameters
+        self.shuffle_queue_size = self.batch_size * 64
 
         # partition data
-        self.partition_count = (self.data_size + self.num_partition - 1) // self.num_partition
-        self.partition_count = ((self.partition_count + batch_size - 1) // batch_size) * batch_size
+        self.partition_count = (len(self.xdataset) + self.world_size - 1) // self.world_size
+        self.partition_count = (self.partition_count + self.batch_size - 1) // self.batch_size
 
-        print("loader rank:{}, partition count:{}".format(self.rank, self.partition_count))
+        print("XLoader rank:{}, partition count:{}".format(self.rank, self.partition_count))
 
-        # decide data and label names
-        self.data_name = data_name
-        self.label_name = label_name
+        # multi-process settings
+        worker_queue_depth = self.batch_size * 64
+        self.worker_queue = multiprocessing.Queue(maxsize=worker_queue_depth)
 
         # status variable for counting
-        self._cur = 0
+        self.__cur = 0
 
-        # multi-thread settings
-        self.num_worker = num_worker
+        # start multi-process
+        self.__reset()
 
-        if (worker_queue_depth is None):
-            worker_queue_depth = self.batch_size * len(ctx) * 10
-        
-        self.data_queue = multiprocessing.Queue(maxsize=worker_queue_depth)
-
-        # get first batch to fill in provide_data and provide_label
-        self.reset()
-        self._thread_start()
-
-    @property
-    def total_record(self):
-        return self.partition_count
-
-    def _thread_start(self):
-        # load data thread
-        workers = [multiprocessing.Process(target=self.worker, args=[i]) for i in range(self.num_worker)]
-        for w in workers:
+        # start worker
+        self.workers = [multiprocessing.Process(target=self.__worker, args=[i]) for i in range(self.num_workers)]
+        for w in self.workers:
             w.daemon = True
             w.start()
-
-    def reset(self):
-        # reset count
-        self._cur = 0
-
-    def iter_next(self):
-        return self._cur + self.batch_size <= self.total_record
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self.iter_next():
-            self._cur += self.batch_size
-            result = self.load_batch()
-            return result
-        else:
-            raise StopIteration
-
-    def transform_iter(self, it, context):
-        for data in it:
-            for meta_data in self.transform(data, self.transform_kwargs, context):
-                self.data_queue.put(meta_data)
-
-    def transform_iter_shuffle(self, it, context):
+    
+    def __del__(self):
+        self.__shutdown()
+    
+    def __shutdown(self):
+        if len(self.workers) > 0:
+            for w in self.workers:
+                if w.is_alive():
+                    w.terminate()
+                while w.is_alive():
+                    pass
+                w.close()
+    
+    def __worker(self, idx):
         buffers = []
-        for data in it:
-            for meta_data in self.transform(data, self.transform_kwargs, context):
+        rank = self.rank
+        while True:
+            part = (idx * self.world_size + rank, self.num_workers * self.world_size)
+            for data in self.xdataset.gene_iter(part):
                 if len(buffers) >= self.shuffle_queue_size:
                     random_index = np.random.randint(len(buffers))
                     item_tmp = buffers[random_index]
-                    buffers[random_index] = meta_data
-                    self.data_queue.put(item_tmp)
+                    buffers[random_index] = data
+                    self.worker_queue.put(item_tmp)
                 else:
-                    buffers.append(meta_data)
-        
-        self.random_state.shuffle(buffers)
-        for meta_data in buffers:
-            self.data_queue.put(meta_data)
-
-    def worker(self, idx):
-        while True:
-            description = {"data": "byte"}
-            shard = (idx * self.num_partition + self.rank, self.num_worker * self.num_partition)
-            context = self.ctx[idx % len(self.ctx)]
-            it = reader.tfrecord_loader('{}.rec'.format(self.record_file), '{}.idx'.format(self.record_file), description, shard)
-            if self.shuffle:
-                self.transform_iter_shuffle(it, context)
-            else:
-                self.transform_iter(it, context)
-
+                    buffers.append(data)
+            
             # transfer into next data block
-            self.rank = self.rank + 1
-            self.rank = self.rank % self.num_partition
-
-    def load_batch(self):
+            rank = rank + 1
+            rank = rank % self.world_size
+    
+    def __reset(self):
+        # reset count
+        self.__cur = 0
+    
+    def __iter__(self):
+        self.__reset()
+        return self
+    
+    def __next__(self):
+        if self.__cur < len(self):
+            result = self.collector()
+            self.__cur += 1
+            return result
+        else:
+            raise StopIteration
+    
+    def collector(self):
         records = []
         for i in range(self.batch_size):
-            records.append(self.data_queue.get())
-
-        data = []
-        provide_data = []
-        for name in self.data_name:
-            mx_data = mx.nd.array(np.stack([r[name] for r in records]))
-            data.append(mx_data)
-            provide_data.append((name, mx_data.shape))
-
-        label = []
-        provide_label = []
-        for name in self.label_name:
-            mx_data = mx.nd.array(np.stack([r[name] for r in records]))
-            label.append(mx_data)
-            provide_label.append((name, mx_data.shape))
-
-        file_name_list = [r['file_name'] for r in records]
-        data_batch = mx.io.DataBatch(data=data,
-                                    label=label,
-                                    provide_data=provide_data,
-                                    provide_label=provide_label)
+            records.append(self.worker_queue.get())
         
-        return (data_batch, file_name_list)
-
+        if self.collate_fn is None:
+            return records
+        else:
+            batch_data = self.collate_fn(records)
+            return batch_data
+    
     def __len__(self):
-        return self.total_record
+        return self.partition_count
+
+
+class XTestLoader(object):
+    """
+    A fast dataset loader for distributed testing
+    """
+    def __init__(self, xdataset, batch_size=1, num_workers=1, rank=0, world_size=1, collate_fn=collate_fn_default):
+        """
+        xdataset: an object of XDataset
+        batch_size: batch_size on each node
+        num_workers: number of workers on each node
+        rank: rank of the node
+        world_size: total number of the nodes
+        collate_fn: merges a list of samples to form a mini-batch of Tensor
+        """
+        self.xdataset = xdataset
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.rank = rank
+        self.world_size = world_size
+        self.collate_fn = collate_fn
+
+        assert isinstance(self.xdataset, XDataset)
+        assert self.rank < self.world_size
+
+        # multi-process settings
+        worker_queue_depth = self.batch_size * 64
+        self.worker_queue = multiprocessing.Queue(maxsize=worker_queue_depth)
+
+        self.workers = []
+    
+    def __del__(self):
+        self.__shutdown()
+    
+    def __shutdown(self):
+        if len(self.workers) > 0:
+            for w in self.workers:
+                if w.is_alive():
+                    w.terminate()
+                while w.is_alive():
+                    pass
+                w.close()
+    
+    def __worker(self, idx):
+        part = (idx * self.world_size + self.rank, self.num_workers * self.world_size)
+        for data in self.xdataset.gene_iter(part):
+            self.worker_queue.put(data)
+    
+    def __reset(self):
+        # clear existing resouces
+        self.__shutdown()
+        while not self.worker_queue.empty():
+            self.worker_queue.get()
+        
+        # re-allocate resouces
+        self.workers = [multiprocessing.Process(target=self.__worker, args=[i]) for i in range(self.num_workers)]
+        for w in self.workers:
+            w.daemon = True
+            w.start()
+    
+    def __iter__(self):
+        self.__reset()
+        return self
+    
+    def __is_all_done(self):
+        for w in self.workers:
+            if w.is_alive():
+                return False
+        return True
+    
+    def __next__(self):
+        result = self.collector()
+        if result is not None:
+            return result
+        else:
+            raise StopIteration
+    
+    def collector(self):
+        records = []
+        if self.__is_all_done() and self.worker_queue.empty():
+            return None
+        else:
+            for i in range(self.batch_size):
+                try:
+                    records.append(self.worker_queue.get(timeout=2))
+                except:
+                    pass
+            
+            length_tmp = len(records)
+            if length_tmp == 0:
+                return None
+            for i in range(length_tmp, self.batch_size):
+                records.append(records[0])
+        
+        if self.collate_fn is None:
+            return records
+        else:
+            batch_data = self.collate_fn(records)
+            return batch_data
+    
+    def __len__(self):
+        raise NotImplementedError

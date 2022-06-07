@@ -1,2 +1,2 @@
 from .xrecord import XRecord, XRecordReadList
-from .xloader import XLoader
+from .xloader import XDataset, XTrainLoader, XTestLoader

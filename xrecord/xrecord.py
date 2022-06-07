@@ -79,6 +79,11 @@ class XRecord(object):
         return template_bytes_view
     
     def read_iter(self, part=None):
+        """
+        part=(part_id, part_num) means the total dataset is split into "part_num" parts
+        and the $part_id_{th}$ part is used, which is required in the distributed training system.
+        By default, part is set as None, meaning that the whole dataset is loaded.
+        """
         if part == None:
             part = (0, 1)
         
@@ -161,6 +166,11 @@ class XRecordReadList(object):
         return template_bytes_view
     
     def read_iter(self, part=None):
+        """
+        part=(part_id, part_num) means the total dataset is split into "part_num" parts
+        and the $part_id_{th}$ part is used, which is required in the distributed training system.
+        By default, part is set as None, meaning that the whole dataset is loaded.
+        """
         if part == None:
             part = (0, 1)
         
