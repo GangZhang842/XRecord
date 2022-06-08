@@ -57,30 +57,35 @@ class XTrainLoader(object):
     """
     A fast dataset loader for distributed training
     """
-    def __init__(self, xdataset, batch_size=1, num_workers=1, rank=0, world_size=1, collate_fn=collate_fn_default):
+    def __init__(self, xdataset_class, xdataset_args, batch_size=1, num_workers=1, rank=0, world_size=1, collate_fn=collate_fn_default):
         """
-        xdataset: an object of XDataset
+        xdataset_class: a subclass of XDataset
+        xdataset_args: arguments of the subclass
         batch_size: batch_size on each node
         num_workers: number of workers on each node
         rank: rank of the node
         world_size: total number of the nodes
         collate_fn: merges a list of samples to form a mini-batch of Tensor
         """
-        self.xdataset = xdataset
+        self.xdataset_class = xdataset_class
+        self.xdataset_args = xdataset_args
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.rank = rank
         self.world_size = world_size
         self.collate_fn = collate_fn
 
-        assert isinstance(self.xdataset, XDataset)
+        assert issubclass(self.xdataset_class, XDataset)
+        assert type(self.xdataset_args) in [list, tuple]
+        assert self.num_workers >= 1
         assert self.rank < self.world_size
 
         # shuffle data parameters
         self.shuffle_queue_size = self.batch_size * 64
 
         # partition data
-        self.partition_count = (len(self.xdataset) + self.world_size - 1) // self.world_size
+        self.xdataset_obj_list = [self.xdataset_class(*self.xdataset_args) for i in range(self.num_workers)]
+        self.partition_count = (len(self.xdataset_obj_list[0]) + self.world_size - 1) // self.world_size
         self.partition_count = (self.partition_count + self.batch_size - 1) // self.batch_size
 
         print("XLoader rank:{}, partition count:{}".format(self.rank, self.partition_count))
@@ -96,7 +101,7 @@ class XTrainLoader(object):
         self.__reset()
 
         # start worker
-        self.workers = [multiprocessing.Process(target=self.__worker, args=[i]) for i in range(self.num_workers)]
+        self.workers = [multiprocessing.Process(target=self.__worker, args=[i, self.xdataset_obj_list[i]]) for i in range(self.num_workers)]
         for w in self.workers:
             w.daemon = True
             w.start()
@@ -113,12 +118,12 @@ class XTrainLoader(object):
                     pass
                 w.close()
     
-    def __worker(self, idx):
+    def __worker(self, idx, xdataset_obj):
         rank = self.rank
         while True:
             buffers = []
             part = (idx * self.world_size + rank, self.num_workers * self.world_size)
-            for data in self.xdataset.gene_iter(part):
+            for data in xdataset_obj.gene_iter(part):
                 if len(buffers) >= self.shuffle_queue_size:
                     random_index = np.random.randint(len(buffers))
                     item_tmp = buffers[random_index]
@@ -170,28 +175,34 @@ class XTestLoader(object):
     """
     A fast dataset loader for distributed testing
     """
-    def __init__(self, xdataset, batch_size=1, num_workers=1, rank=0, world_size=1, collate_fn=collate_fn_default):
+    def __init__(self, xdataset_class, xdataset_args, batch_size=1, num_workers=1, rank=0, world_size=1, collate_fn=collate_fn_default):
         """
-        xdataset: an object of XDataset
+        xdataset_class: a subclass of XDataset
+        xdataset_args: arguments of the subclass
         batch_size: batch_size on each node
         num_workers: number of workers on each node
         rank: rank of the node
         world_size: total number of the nodes
         collate_fn: merges a list of samples to form a mini-batch of Tensor
         """
-        self.xdataset = xdataset
+        self.xdataset_class = xdataset_class
+        self.xdataset_args = xdataset_args
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.rank = rank
         self.world_size = world_size
         self.collate_fn = collate_fn
 
-        assert isinstance(self.xdataset, XDataset)
+        assert issubclass(self.xdataset_class, XDataset)
+        assert type(self.xdataset_args) in [list, tuple]
+        assert self.num_workers >= 1
         assert self.rank < self.world_size
 
         # multi-process settings
         worker_queue_depth = self.batch_size * 64
         self.worker_queue = multiprocessing.Queue(maxsize=worker_queue_depth)
+
+        self.xdataset_obj_list = [self.xdataset_class(*self.xdataset_args) for i in range(self.num_workers)]
 
         self.workers = []
     
@@ -207,9 +218,9 @@ class XTestLoader(object):
                     pass
                 w.close()
     
-    def __worker(self, idx):
+    def __worker(self, idx, xdataset_obj):
         part = (idx * self.world_size + self.rank, self.num_workers * self.world_size)
-        for data in self.xdataset.gene_iter(part):
+        for data in xdataset_obj.gene_iter(part):
             self.worker_queue.put(data)
     
     def __reset(self):
@@ -219,7 +230,7 @@ class XTestLoader(object):
             self.worker_queue.get()
         
         # re-allocate resouces
-        self.workers = [multiprocessing.Process(target=self.__worker, args=[i]) for i in range(self.num_workers)]
+        self.workers = [multiprocessing.Process(target=self.__worker, args=[i, self.xdataset_obj_list[i]]) for i in range(self.num_workers)]
         for w in self.workers:
             w.daemon = True
             w.start()
