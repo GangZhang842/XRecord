@@ -80,9 +80,11 @@ class XTrainLoader(object):
         assert self.num_workers >= 1
         assert self.rank < self.world_size
 
-        # shuffle buffers
-        self.shuffle_queue_size = self.batch_size * 16
+        # shuffle buffers and collector
+        collector_queue_depth = 8
+        self.shuffle_queue_size = self.batch_size * collector_queue_depth
         self.buffers = []
+        self.collector_queue = multiprocessing.Queue(maxsize=collector_queue_depth)
 
         # partition data
         self.xdataset_obj_list = [self.xdataset_class(*self.xdataset_args) for i in range(self.num_workers)]
@@ -98,7 +100,7 @@ class XTrainLoader(object):
         # status variable for counting
         self.__cur = 0
 
-        # start multi-process
+        # reset
         self.__reset()
 
         # start worker
@@ -106,18 +108,24 @@ class XTrainLoader(object):
         for w in self.workers:
             w.daemon = True
             w.start()
+        
+        # start collector
+        self.collectors = [multiprocessing.Process(target=self.__collector, args=[i]) for i in range(1)]
+        for c in self.collectors:
+            c.daemon = True
+            c.start()
     
     def __del__(self):
         self.__shutdown()
     
     def __shutdown(self):
-        if len(self.workers) > 0:
-            for w in self.workers:
-                if w.is_alive():
-                    w.terminate()
-                while w.is_alive():
-                    pass
-                w.close()
+        for w in self.workers:
+            if w.is_alive():
+                w.terminate()
+        
+        for c in self.collectors:
+            if c.is_alive():
+                c.terminate()
     
     def __worker(self, idx, xdataset_obj):
         rank = self.rank
@@ -130,6 +138,24 @@ class XTrainLoader(object):
             rank = rank + 1
             rank = rank % self.world_size
     
+    def __collector(self, idx):
+        while True:
+            while len(self.buffers) < self.shuffle_queue_size:
+                self.buffers.append(self.worker_queue.get())
+            
+            records = []
+            random_index_batch = np.random.randint(0, len(self.buffers), (self.batch_size,))
+            for random_index in random_index_batch:
+                item_tmp = self.buffers[random_index]
+                records.append(item_tmp)
+                self.buffers[random_index] = self.worker_queue.get()
+            
+            if self.collate_fn is None:
+                self.collector_queue.put(records)
+            else:
+                batch_data = self.collate_fn(records)
+                self.collector_queue.put(batch_data)
+    
     def __reset(self):
         # reset count
         self.__cur = 0
@@ -140,28 +166,11 @@ class XTrainLoader(object):
     
     def __next__(self):
         if self.__cur < len(self):
-            result = self.collector()
+            result = self.collector_queue.get()
             self.__cur += 1
             return result
         else:
             raise StopIteration
-    
-    def collector(self):
-        while len(self.buffers) < self.shuffle_queue_size:
-            self.buffers.append(self.worker_queue.get())
-        
-        records = []
-        random_index_batch = np.random.randint(0, len(self.buffers), (self.batch_size,))
-        for random_index in random_index_batch:
-            item_tmp = self.buffers[random_index]
-            records.append(item_tmp)
-            self.buffers[random_index] = self.worker_queue.get()
-        
-        if self.collate_fn is None:
-            return records
-        else:
-            batch_data = self.collate_fn(records)
-            return batch_data
     
     def __len__(self):
         return self.partition_count
@@ -195,7 +204,7 @@ class XTestLoader(object):
         assert self.rank < self.world_size
 
         # multi-process settings
-        worker_queue_depth = self.batch_size * 8
+        worker_queue_depth = self.batch_size * 16
         self.worker_queue = multiprocessing.Queue(maxsize=worker_queue_depth)
 
         self.xdataset_obj_list = [self.xdataset_class(*self.xdataset_args) for i in range(self.num_workers)]
@@ -206,13 +215,9 @@ class XTestLoader(object):
         self.__shutdown()
     
     def __shutdown(self):
-        if len(self.workers) > 0:
-            for w in self.workers:
-                if w.is_alive():
-                    w.terminate()
-                while w.is_alive():
-                    pass
-                w.close()
+        for w in self.workers:
+            if w.is_alive():
+                w.terminate()
     
     def __worker(self, idx, xdataset_obj):
         part = (idx * self.world_size + self.rank, self.num_workers * self.world_size)
@@ -242,13 +247,13 @@ class XTestLoader(object):
         return True
     
     def __next__(self):
-        result = self.collector()
+        result = self.__collector()
         if result is not None:
             return result
         else:
             raise StopIteration
     
-    def collector(self):
+    def __collector(self):
         records = []
         if self.__is_all_done() and self.worker_queue.empty():
             return None
