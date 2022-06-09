@@ -81,7 +81,7 @@ class XTrainLoader(object):
         assert self.rank < self.world_size
 
         # shuffle data parameters
-        self.shuffle_queue_size = self.batch_size * 64
+        self.shuffle_queue_size = self.batch_size * 8
 
         # partition data
         self.xdataset_obj_list = [self.xdataset_class(*self.xdataset_args) for i in range(self.num_workers)]
@@ -91,7 +91,7 @@ class XTrainLoader(object):
         print("XLoader rank:{}, partition count:{}".format(self.rank, self.partition_count))
 
         # multi-process settings
-        worker_queue_depth = self.batch_size * 64
+        worker_queue_depth = self.batch_size * 8
         self.worker_queue = multiprocessing.Queue(maxsize=worker_queue_depth)
 
         # status variable for counting
@@ -199,7 +199,7 @@ class XTestLoader(object):
         assert self.rank < self.world_size
 
         # multi-process settings
-        worker_queue_depth = self.batch_size * 64
+        worker_queue_depth = self.batch_size * 8
         self.worker_queue = multiprocessing.Queue(maxsize=worker_queue_depth)
 
         self.xdataset_obj_list = [self.xdataset_class(*self.xdataset_args) for i in range(self.num_workers)]
