@@ -80,8 +80,9 @@ class XTrainLoader(object):
         assert self.num_workers >= 1
         assert self.rank < self.world_size
 
-        # shuffle data parameters
-        self.shuffle_queue_size = self.batch_size * 8
+        # shuffle buffers
+        self.shuffle_queue_size = self.batch_size * 16
+        self.buffers = []
 
         # partition data
         self.xdataset_obj_list = [self.xdataset_class(*self.xdataset_args) for i in range(self.num_workers)]
@@ -91,7 +92,7 @@ class XTrainLoader(object):
         print("XLoader rank:{}, partition count:{}".format(self.rank, self.partition_count))
 
         # multi-process settings
-        worker_queue_depth = self.batch_size * 8
+        worker_queue_depth = self.batch_size * 16
         self.worker_queue = multiprocessing.Queue(maxsize=worker_queue_depth)
 
         # status variable for counting
@@ -121,19 +122,8 @@ class XTrainLoader(object):
     def __worker(self, idx, xdataset_obj):
         rank = self.rank
         while True:
-            buffers = []
             part = (idx * self.world_size + rank, self.num_workers * self.world_size)
             for data in xdataset_obj.gene_iter(part):
-                if len(buffers) >= self.shuffle_queue_size:
-                    random_index = np.random.randint(len(buffers))
-                    item_tmp = buffers[random_index]
-                    buffers[random_index] = data
-                    self.worker_queue.put(item_tmp)
-                else:
-                    buffers.append(data)
-            
-            random.shuffle(buffers)
-            for data in buffers:
                 self.worker_queue.put(data)
             
             # transfer into next data block
@@ -157,9 +147,15 @@ class XTrainLoader(object):
             raise StopIteration
     
     def collector(self):
+        while len(self.buffers) < self.shuffle_queue_size:
+            self.buffers.append(self.worker_queue.get())
+        
         records = []
-        for i in range(self.batch_size):
-            records.append(self.worker_queue.get())
+        random_index_batch = np.random.randint(0, len(self.buffers), (self.batch_size,))
+        for random_index in random_index_batch:
+            item_tmp = self.buffers[random_index]
+            records.append(item_tmp)
+            self.buffers[random_index] = self.worker_queue.get()
         
         if self.collate_fn is None:
             return records
